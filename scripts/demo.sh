@@ -60,3 +60,10 @@ cp "$WORK/day1.csv" "$WORK/tampered.csv"
 printf 'X' >> "$WORK/tampered.csv"
 python3 -m app.verify inclusion \
   --proof "$WORK/inclusion.json" --file "$WORK/tampered.csv" || true
+
+echo "== 9. 容量状态与一次性扩容 =="
+curl -s "$BASE/capacity" | python3 -m json.tool
+echo "--- 未满时扩容（期望 HTTP 409）---"
+curl -s -w "\nHTTP %{http_code}\n" -X POST "$BASE/capacity/expand" || true
+echo "提示：把卷发满后再次 POST /capacity/expand，容量 128 -> 256（深度 7 -> 8），"
+echo "      可从第 129 件续发；完整扩容交错与跨界核验见 scripts/dual_instance_check.py。"

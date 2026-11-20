@@ -196,19 +196,28 @@ def _subtree_root(
 
 
 def append_proof(
-    leaf_hashes: Sequence[bytes], old_count: int, depth: int
+    leaf_hashes: Sequence[bytes],
+    old_count: int,
+    depth: int,
+    old_depth: int | None = None,
 ) -> list[dict]:
     """生成从 ``old_count`` 号旧检查点到当前检查点的追加证明。
 
     返回的每个条目描述一个完美子树：起点、高度、子树根哈希。
     旧前缀 [0, old_count) 与新增区间 [old_count, new_count) 分别平铺，
     条目总数不超过 ``2 * depth``。
+
+    跨扩容（``old_depth`` 小于新 ``depth``）且新旧条数恰相等时（在扩容点
+    对旧检查点取证明），仍平铺旧前缀作为锚点条目，使离线端能同时在旧深度
+    重建旧根、在新深度重建新根。
     """
+    if old_depth is None:
+        old_depth = depth
     new_count = len(leaf_hashes)
     if not 0 <= old_count <= new_count:
         raise ValueError("旧条数必须介于 0 与当前条数之间")
-    if old_count == new_count:
-        # 同一检查点之间的一致性证明为空。
+    if old_count == new_count and old_depth == depth:
+        # 同一棵树、同一检查点之间的一致性证明为空。
         return []
     entries: list[dict] = []
     for start, height in _tile(0, old_count, depth) + _tile(
@@ -231,6 +240,11 @@ def _rebuild_root(
 
     仅承认覆盖 [0, covered) 的条目；其余槽位按 EMPTY_LEAF 处理。
     条目若存在重叠、缺口、错位则返回 None。
+
+    跨扩容核验时同一份条目可能来自更深的树（例如扩容后深度 8 的证明，
+    还要在扩容前深度 7 的旧树下重建旧根）：凡超出当前树容量或高度超过
+    当前深度的条目，在本树下不参与重建（递归到对应范围时按 EMPTY_LEAF
+    之外的真实路径处理）；同深度下所有条目仍严格受检，安全性不变。
     """
     capacity = 1 << depth
     by_start: dict[int, dict] = {}
@@ -241,9 +255,12 @@ def _rebuild_root(
             digest = bytes.fromhex(entry["hash"])
         except (KeyError, TypeError, ValueError):
             return None
-        if not (0 <= start < capacity and 0 <= height <= depth):
+        if len(digest) != 32:
             return None
-        if len(digest) != 32 or start in by_start:
+        # 跨深度：该条目不属于当前这棵更浅的树，忽略之。
+        if not (0 <= start < capacity and 0 <= height <= depth):
+            continue
+        if start in by_start:
             return None
         if start % (1 << height) != 0:
             return None
@@ -283,27 +300,48 @@ def verify_append(
     new_count: int,
     entries: Sequence[dict],
     depth: int,
+    old_depth: int | None = None,
 ) -> bool:
     """离线核验追加证明：旧检查点是新检查点的仅追加前缀。
 
     纯函数，只需两个留存检查点的根、条数与证明本身，不接触服务端。
+
+    ``depth`` 为新检查点的树深度；``old_depth`` 为旧检查点的树深度，
+    缺省视为与新树同深（扩容前的全部历史证明）。扩容跨越树深度时
+    （深度 7 -> 8），同一份平铺条目分别在旧深度与新深度下重建两个根，
+    从而离线确认扩容前后历史连续、旧根摘要保持不变。
     """
-    capacity = 1 << depth
+    if old_depth is None:
+        old_depth = depth
     try:
         old_count = int(old_count)
         new_count = int(new_count)
+        depth = int(depth)
+        old_depth = int(old_depth)
     except (TypeError, ValueError):
         return False
-    if not (0 <= old_count <= new_count <= capacity):
+    # 容量只能经一次性扩容翻倍，深度只增不减，且同树下受槽位数约束。
+    if not (0 < old_depth <= depth):
         return False
-    if old_count == new_count:
-        # 同一检查点：证明应为空，且两端留存的根必须一致。
+    if not (0 <= old_count <= (1 << old_depth)):
+        return False
+    if not (0 <= new_count <= (1 << depth)):
+        return False
+    if old_count > new_count:
+        return False
+    if old_count > new_count:
+        return False
+    if old_count > new_count:
+        return False
+    if old_count == new_count and old_depth == depth:
+        # 同树同检查点：证明应为空，且两端留存的根必须一致。
         return not entries and old_root == new_root
+    # 其余情形（含跨深度且条数恰相等的扩容点证明）走条目重建。
 
     rebuilt_new = _rebuild_root(entries, new_count, depth)
     if rebuilt_new is None or rebuilt_new != new_root:
         return False
-    rebuilt_old = _rebuild_root(entries, old_count, depth)
+    rebuilt_old = _rebuild_root(entries, old_count, old_depth)
     if rebuilt_old is None or rebuilt_old != old_root:
         return False
     return True

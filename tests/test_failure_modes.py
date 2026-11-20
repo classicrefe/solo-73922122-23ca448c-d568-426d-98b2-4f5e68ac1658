@@ -120,10 +120,14 @@ def test_existing_checkpoints_remain_valid_after_restart(app_client):
     leaves = main_mod.database.leaf_hashes()
     from app import merkle
 
-    root = merkle.root_from_leaves(leaves, settings.tree_depth)
+    state = main_mod.database.get_capacity_state()
     latest = main_mod.database.latest_checkpoint()
+    # 最新检查点按当前容量对应深度复算一致。
+    root = merkle.root_from_leaves(leaves, state["tree_depth"])
     assert latest["root_hex"] == root.hex()
-    # 全部历史检查点均可被当前叶子集合复现（固定深度树，旧根不变）。
+    # 全部历史检查点按其生成时的树深度复现（扩容前深度小、扩容后深度大），
+    # 旧根摘要保持不变，留存的旧证明持续有效。
     for cp in main_mod.database.list_checkpoints():
-        rebuilt = merkle.root_from_leaves(leaves[: cp["seq"]], settings.tree_depth)
+        rebuilt = merkle.root_from_leaves(leaves[: cp["seq"]], cp["tree_depth"])
         assert rebuilt.hex() == cp["root_hex"]
+        assert cp["tree_depth"] <= state["tree_depth"]

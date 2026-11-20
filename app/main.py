@@ -25,7 +25,9 @@ from .config import settings
 from .db import ConflictError, Database
 from .schemas import (
     AppendProofOut,
+    CapacityStateOut,
     CheckpointOut,
+    ExpansionResultOut,
     HealthOut,
     InclusionProofOut,
     LeafRecordOut,
@@ -240,8 +242,11 @@ async def inclusion_proof(station_id: str, sample_date: str, order_no: str):
         raise HTTPException(404, "未找到该站号/日期/发布单号对应的发布记录")
     index = record["id"] - 1
     leaves = await run_in_threadpool(database.leaf_hashes)
-    path = merkle.inclusion_path(index, leaves, settings.tree_depth)
     checkpoint = await run_in_threadpool(database.latest_checkpoint)
+    # 深度以最新检查点为准：扩容后为 8，扩容前的旧证明 JSON 仍带深度 7，
+    # 离线端按证明自带的 tree_depth 核验，新旧证明互不影响。
+    depth = checkpoint["tree_depth"]
+    path = merkle.inclusion_path(index, leaves, depth)
     leaf_record = LeafRecordOut(
         v=merkle.LEAF_VERSION,
         station_id=record["station_id"],
@@ -254,7 +259,7 @@ async def inclusion_proof(station_id: str, sample_date: str, order_no: str):
         index=index,
         checkpoint_seq=checkpoint["seq"],
         checkpoint_root=checkpoint["root_hex"],
-        tree_depth=settings.tree_depth,
+        tree_depth=depth,
         leaf_record=leaf_record,
         leaf_hash=leaves[index].hex(),
         path=[step.to_dict() for step in path],
@@ -264,7 +269,7 @@ async def inclusion_proof(station_id: str, sample_date: str, order_no: str):
 @app.get(
     "/checkpoints/{old_seq}/append-proof",
     response_model=AppendProofOut,
-    summary="旧检查点到新检查点的追加证明（条目数 O(log n)）",
+    summary="旧检查点到新检查点的追加证明（条目数 O(log n)，支持跨扩容）",
 )
 async def append_proof(old_seq: int):
     _require_healthy()
@@ -275,16 +280,73 @@ async def append_proof(old_seq: int):
     leaves = await run_in_threadpool(database.leaf_hashes)
     if new_cp["seq"] != len(leaves):
         raise HTTPException(500, "检查点与叶子条数不一致")
+    old_depth = old_cp["tree_depth"]
+    new_depth = new_cp["tree_depth"]
+    # 条目一律按新树（最深）平铺：同一份条目既能在新深度重建新根，
+    # 也能在旧深度重建旧根，离线确认跨扩容的历史连续。
     entries = await run_in_threadpool(
-        merkle.append_proof, leaves, old_cp["seq"], settings.tree_depth
+        merkle.append_proof, leaves, old_cp["seq"], new_depth, old_depth
     )
     return AppendProofOut(
         old_seq=old_cp["seq"],
         new_seq=new_cp["seq"],
         old_root=old_cp["root_hex"],
         new_root=new_cp["root_hex"],
-        tree_depth=settings.tree_depth,
+        tree_depth=new_depth,
+        old_tree_depth=old_depth,
         entries=entries,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 容量与一次性扩容
+# --------------------------------------------------------------------------- #
+@app.get(
+    "/capacity",
+    response_model=CapacityStateOut,
+    summary="查询当前容量上限、树深度与已发布条数",
+)
+async def get_capacity():
+    state = await run_in_threadpool(database.get_capacity_state)
+    return CapacityStateOut(
+        capacity=state["capacity"],
+        tree_depth=state["tree_depth"],
+        release_count=state["release_count"],
+        expanded=state["capacity"] > state["initial_capacity"],
+        remaining=state["capacity"] - state["release_count"],
+    )
+
+
+@app.post(
+    "/capacity/expand",
+    response_model=ExpansionResultOut,
+    status_code=200,
+    summary="一次性扩容：仅在发满当前容量时把上限 128 升到 256",
+)
+async def expand_capacity():
+    """两实例并发调用时由 SQLite BEGIN IMMEDIATE 串行化，只有一次真正生效。
+
+    扩容只更新共享卷上的容量元数据：不写检查点、不占发布序号，
+    旧检查点的条数与根摘要保持不变；失败（未满/已扩过/锁错误）时
+    容量与发布历史原样保留，客户端可重试。
+    """
+    _require_healthy()
+    try:
+        result = await run_in_threadpool(database.expand_capacity)
+    except ConflictError as exc:
+        # 前置条件不满足：状态未变，返回 409，可原样重试。
+        raise HTTPException(409, str(exc))
+    return ExpansionResultOut(
+        expanded=result["expanded"],
+        previous_capacity=result["previous_capacity"],
+        capacity=result["capacity"],
+        previous_tree_depth=result["tree_depth"] - 1,
+        tree_depth=result["tree_depth"],
+        release_count=result["release_count"],
+        message=(
+            f"容量已由 {result['previous_capacity']} 件扩容至 "
+            f"{result['capacity']} 件，可从第 {result['release_count'] + 1} 件续发"
+        ),
     )
 
 
@@ -294,10 +356,12 @@ async def append_proof(old_seq: int):
 @app.get("/health", response_model=HealthOut, summary="存储自检与健康状态")
 async def health():
     problems = list(_startup_problems)
-    rows = await run_in_threadpool(database.list_releases)
+    state = await run_in_threadpool(database.get_capacity_state)
     return HealthOut(
         status="ok" if not problems else "degraded",
-        release_count=len(rows),
+        release_count=state["release_count"],
+        capacity=state["capacity"],
+        tree_depth=state["tree_depth"],
         problems=problems,
     )
 
@@ -309,7 +373,8 @@ def root():
         "docs": "/docs",
         "limits": {
             "max_file_bytes": settings.max_file_bytes,
-            "max_releases": settings.max_releases,
-            "tree_depth": settings.tree_depth,
+            "initial_max_releases": settings.max_releases,
+            "initial_tree_depth": settings.tree_depth,
+            "note": "运行期容量以共享卷 meta 表为准，见 GET /capacity",
         },
     }

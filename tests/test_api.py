@@ -164,21 +164,94 @@ def test_append_proof_chain_and_offline_verification(app_client):
     ok, _ = verify_append_proof(forged, latest, proof)
     assert not ok
 
-def test_capacity_enforced(app_client):
-    client, _, settings = app_client
-    # 临时把限额降到当前条数，避免实际占满存储而影响后续故障用例。
-    existing = len(client.get("/releases").json())
-    original_limit = settings.max_releases
-    object.__setattr__(settings, "max_releases", existing)
+def test_capacity_enforced(app_client, tmp_path):
+    """发满 -> 409 -> 一次性扩容 -> 续发，使用独立临时卷，不污染会话数据。"""
+    from fastapi.testclient import TestClient
+
+    from app.config import Settings
+    from app.db import Database
+    from app.main import app
+    from app.storage import BlobStore
+
+    data_dir = tmp_path / "cap-vol"
+    data_dir.mkdir()
+    cap = 8  # 小容量快速发满，深度 3；扩容后 16，深度 4
+    local_settings = Settings(
+        data_dir=data_dir,
+        db_path=data_dir / "release.db",
+        blob_dir=data_dir / "blobs",
+        temp_dir=data_dir / "tmp",
+        max_file_bytes=app_client[2].max_file_bytes,
+        max_releases=cap,
+        tree_depth=3,
+    )
+    local_store = BlobStore(local_settings)
+    local_db = Database(local_settings)
+
+    # 直接通过 DB/存储层发满，避免起第二套 HTTP 应用。
+    def db_publish(idx: int):
+        data = _csv(f"cap-{idx}")
+        digest, _ = local_store.store(data)
+        return local_db.publish(
+            f"CP{idx:02d}", "2026-11-16", f"ORD-C{idx:02d}", digest, len(data)
+        )
+
+    for i in range(1, cap + 1):
+        record, reused = db_publish(i)
+        assert reused is False and record["id"] == i
+    assert local_db.get_capacity_state()["release_count"] == cap
+
+    # 发满后下一件 409。
+    overflow = _csv("overflow")
+    d, _ = local_store.store(overflow)
+    import pytest as _pytest
+
+    from app.db import ConflictError
+
+    with _pytest.raises(ConflictError) as exc:
+        local_db.publish("CPX", "2026-11-16", "ORD-CX", d, len(overflow))
+    assert "上限" in str(exc.value)
+
+    # 未满拒绝由 test_expansion 覆盖；这里发满状态扩容成功 8 -> 16。
+    result = local_db.expand_capacity()
+    assert result["expanded"] is True
+    assert result["capacity"] == 16 and result["previous_capacity"] == 8
+    assert result["tree_depth"] == 4
+
+    # 一次性：再次扩容被拒。
+    with _pytest.raises(ConflictError) as exc2:
+        local_db.expand_capacity()
+    assert "不可重复" in str(exc2.value)
+
+    # 扩容不占序号、不写检查点：最新检查点 seq 仍为 cap。
+    assert local_db.latest_checkpoint()["seq"] == cap
+    assert len(local_db.list_checkpoints()) == cap + 1
+
+    # 扩容后从第 cap+1 件续发，新检查点深度为 4。
+    record9, reused = db_publish(cap + 1)
+    assert reused is False and record9["id"] == cap + 1
+    cp9 = local_db.get_checkpoint(cap + 1)
+    assert cp9["tree_depth"] == 4
+
+    # 容量状态端点语义（通过独立 HTTP 应用验证 /capacity 与 /health）。
+    import app.main as main_mod
+
+    orig_store, orig_db = main_mod.blob_store, main_mod.database
+    main_mod.blob_store, main_mod.database = local_store, local_db
     try:
-        r = _publish(client, "CAPX", "2026-11-16", "ORD-X", _csv("overflow"))
-        assert r.status_code == 409
-        assert "上限" in r.json()["detail"]
-        assert len(client.get("/releases").json()) == existing
+        with TestClient(app) as client:
+            state = client.get("/capacity").json()
+            assert state == {
+                "capacity": 16,
+                "tree_depth": 4,
+                "release_count": cap + 1,
+                "expanded": True,
+                "remaining": 16 - (cap + 1),
+            }
+            assert client.get("/health").json()["capacity"] == 16
+            # HTTP 层扩容再次调用仍被拒。
+            again = client.post("/capacity/expand")
+            assert again.status_code == 409
     finally:
-        object.__setattr__(settings, "max_releases", original_limit)
-    # 限额恢复后发布立即恢复正常。
-    assert _publish(
-        client, "CAPOK", "2026-11-16", "ORD-OK", _csv("ok")
-    ).status_code == 201
+        main_mod.blob_store, main_mod.database = orig_store, orig_db
 

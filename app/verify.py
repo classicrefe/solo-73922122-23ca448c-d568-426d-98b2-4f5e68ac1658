@@ -69,24 +69,46 @@ def verify_release_bytes(proof: dict, raw_bytes: bytes) -> tuple[bool, str]:
 def verify_append_proof(
     old_checkpoint: dict, new_checkpoint: dict, proof: dict
 ) -> tuple[bool, str]:
-    """核验旧检查点到新检查点为仅追加前缀关系（历史未被删除或替换）。"""
+    """核验旧检查点到新检查点为仅追加前缀关系（历史未被删除或替换）。
+
+    支持跨扩容核验：证明中的 ``old_tree_depth``（缺省回退到旧检查点自带
+    的 ``tree_depth``，再缺省视为与新树同深）与新树深度不同时，同一份
+    平铺条目会分别在两棵树下重建旧根与新根，确认扩容前后历史连续。
+    """
     try:
-        depth = int(proof["tree_depth"])
+        new_depth = int(proof["tree_depth"])
+        if "old_tree_depth" in proof:
+            old_depth = int(proof["old_tree_depth"])
+        elif "tree_depth" in old_checkpoint:
+            old_depth = int(old_checkpoint["tree_depth"])
+        else:
+            old_depth = new_depth
+        # 留存的检查点若自带树深度，必须与证明声明一致，防止深度字段被篡改。
+        if "tree_depth" in old_checkpoint and int(
+            old_checkpoint["tree_depth"]
+        ) != old_depth:
+            return False, "旧检查点树深度与证明声明不一致"
+        if "tree_depth" in new_checkpoint and int(
+            new_checkpoint["tree_depth"]
+        ) != new_depth:
+            return False, "新检查点树深度与证明声明不一致"
         ok = merkle.verify_append(
             old_root=bytes.fromhex(old_checkpoint["root_hex"]),
             new_root=bytes.fromhex(new_checkpoint["root_hex"]),
             old_count=int(old_checkpoint["seq"]),
             new_count=int(new_checkpoint["seq"]),
             entries=proof["entries"],
-            depth=depth,
+            depth=new_depth,
+            old_depth=old_depth,
         )
     except (KeyError, TypeError, ValueError):
         return False, "追加证明或检查点结构不完整"
     if not ok:
         return False, "追加证明不成立：新检查点不包含完整旧前缀，历史可能被改动"
+    cross = "（跨扩容，深度 %d -> %d）" % (old_depth, new_depth) if old_depth != new_depth else ""
     return True, (
         f"通过：{old_checkpoint['seq']} 号检查点是 {new_checkpoint['seq']} 号"
-        "检查点的完整仅追加前缀"
+        f"检查点的完整仅追加前缀{cross}"
     )
 
 
